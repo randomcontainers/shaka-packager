@@ -1,0 +1,165 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=ubuntu:26.04
+
+FROM ${BASE_IMAGE} AS build
+ARG DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+# The base image's packages are recorded before anything is installed, so that
+# runtime-deps can leave them out. Every image that installs runtime-deps is
+# built on the same base. CMake runs python3 to write the version string and
+# the license notice that packager --licenses prints.
+RUN dpkg-query -W -f '${Package}\n' | LC_ALL=C sort -u > /tmp/base-packages; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      cmake \
+      git \
+      ninja-build \
+      python3; \
+    rm -rf /var/lib/apt/lists/*
+
+# Shaka Packager attaches prebuilt binaries to its releases but no source
+# tarball with its submodules, so the release tag is cloned and must point to
+# the commit pinned in package.yml. That commit records the commit of each
+# submodule, and every submodule must be checked out at it.
+ARG VERSION
+ARG SOURCE_COMMIT
+RUN printf '%s\n' "${VERSION}" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' \
+      || { echo "unexpected VERSION: ${VERSION}" >&2; exit 1; }; \
+    printf '%s\n' "${SOURCE_COMMIT}" | grep -Eqx '[0-9a-f]{40}' \
+      || { echo "SOURCE_COMMIT must be a full commit id" >&2; exit 1; }; \
+    git -c advice.detachedHead=false clone --quiet --depth 1 --branch "v${VERSION}" \
+      https://github.com/shaka-project/shaka-packager.git /src/shaka-packager; \
+    test "$(git -C /src/shaka-packager rev-parse HEAD)" = "${SOURCE_COMMIT}" \
+      || { echo "tag v${VERSION} is not commit ${SOURCE_COMMIT}" >&2; exit 1; }; \
+    git -C /src/shaka-packager submodule update --init --recursive --depth 1 --jobs 4; \
+    git -C /src/shaka-packager submodule status --recursive > /tmp/submodules; \
+    if grep -v '^ ' /tmp/submodules; then echo "submodules not at their recorded commits" >&2; exit 1; fi
+
+# The version string comes from the tag and the commit in .git. Shaka
+# Packager compiles its own code with -Werror and tests release builds with
+# older compilers than the one here, so a new warning must not stop the build.
+# -Werror is set in packager/CMakeLists.txt and also comes from libwebm, which
+# Shaka configures with ENABLE_WERROR: libwebm adds it to the cached
+# CMAKE_CXX_FLAGS, which every directory without its own value uses. Both are
+# turned off, and the compile commands of Shaka's own sources are checked
+# before the build. Third-party code is already compiled with -Wno-error -w.
+# The bundled curl is pointed at the CA bundle of the ca-certificates package.
+# Only the shipped programs are built: the default target also builds the unit
+# tests, googletest and mongoose.
+WORKDIR /src/shaka-packager
+ARG JOBS
+RUN sed -i '/add_compile_options(/s/ -Werror//' packager/CMakeLists.txt; \
+    if grep -n -- '-Werror' packager/CMakeLists.txt; then echo "packager/CMakeLists.txt still sets -Werror" >&2; exit 1; fi; \
+    sed -i 's/^set(ENABLE_WERROR ON)$/set(ENABLE_WERROR OFF)/' packager/third_party/libwebm/CMakeLists.txt; \
+    grep -Fqx 'set(ENABLE_WERROR OFF)' packager/third_party/libwebm/CMakeLists.txt \
+      || { echo "libwebm is still configured with ENABLE_WERROR" >&2; exit 1; }; \
+    cmake -S . -B /src/build -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DBUILD_SHARED_LIBS=OFF \
+      -DFULLY_STATIC=OFF \
+      -DSKIP_INTEGRATION_TESTS=ON \
+      -DCURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt; \
+    ninja -C /src/build -t commands packager mpd_generator > /tmp/commands; \
+    test -s /tmp/commands; \
+    if grep -i mongoose /tmp/commands > /dev/null; then echo "mongoose is linked into the programs" >&2; exit 1; fi; \
+    awk '{ src = ""; for (i = 1; i < NF; i++) if ($i == "-c") src = $(i + 1); \
+           if (src == "" || src ~ /\/third_party\//) next; \
+           s = "ok"; for (i = 1; i <= NF; i++) { if ($i == "-Werror") s = "werror"; if ($i == "-Wno-error") s = "ok" } \
+           print s, src }' /tmp/commands > /tmp/own-sources; \
+    if grep '^werror ' /tmp/own-sources >&2; then echo "these sources are still compiled with -Werror" >&2; exit 1; fi; \
+    grep -q '^ok .*\.cc$' /tmp/own-sources || { echo "no compile commands found for Shaka Packager's own sources" >&2; exit 1; }; \
+    cmake --build /src/build --parallel "${JOBS:-$(nproc)}" --target packager mpd_generator pssh_box_py; \
+    config="$(find /src/build -name curl_config.h)"; \
+    test -f "$config" || { echo "curl_config.h not found once: $config" >&2; exit 1; }; \
+    grep -Fqx '#define CURL_CA_BUNDLE "/etc/ssl/certs/ca-certificates.crt"' "$config" \
+      || { grep CURL_CA "$config" >&2; echo "curl does not use the CA bundle" >&2; exit 1; }
+
+ARG BASE_IMAGE
+# pssh-box.py finds its protobuf modules next to its real path, so bin holds a
+# symlink to it. The license texts come from the submodules; dict.c and list.c
+# of libxml2 carry notices of their own. runtime-deps lists the packages that
+# own the libraries the programs load, minus the base image's packages, plus
+# the packages in runtime-deps.ubuntu.
+RUN --mount=type=bind,source=runtime-deps.ubuntu,target=/tmp/runtime-deps.extra \
+    bin=/out/usr/local/bin; \
+    lib=/out/usr/local/lib/shaka-packager; \
+    meta=/out/usr/local/share/randomcontainers/shaka-packager; \
+    install -d "$bin" "$lib" "$meta/licenses"; \
+    install -m 0755 /src/build/packager/packager /src/build/packager/mpd_generator "$bin/"; \
+    strip "$bin/packager" "$bin/mpd_generator"; \
+    install -m 0755 /src/build/packager/pssh-box.py "$lib/"; \
+    cp -R /src/build/packager/pssh-box-protos "$lib/"; \
+    ln -s ../lib/shaka-packager/pssh-box.py "$bin/pssh-box.py"; \
+    short="$(git rev-parse --short HEAD)"; \
+    printf '%s\n' "$short" | grep -Eqx '[0-9a-f]{7,}'; \
+    for tool in packager mpd_generator; do \
+      "$bin/$tool" --version > "/tmp/$tool-version"; \
+      printf '%s version v%s-%s-release\n' "$tool" "${VERSION}" "$short" | cmp -s - "/tmp/$tool-version" \
+        || { cat "/tmp/$tool-version" >&2; echo "$tool reports another version" >&2; exit 1; }; \
+    done; \
+    PYTHONDONTWRITEBYTECODE=1 "$bin/pssh-box.py" --widevine-system-id \
+      --key-id 00112233445566778899aabbccddeeff --human > /tmp/pssh-box; \
+    grep -Fqx '        00112233-4455-6677-8899-aabbccddeeff' /tmp/pssh-box \
+      || { cat /tmp/pssh-box >&2; exit 1; }; \
+    tp=packager/third_party; \
+    cp LICENSE "$meta/licenses/LICENSE"; \
+    cp "$tp/abseil-cpp/source/LICENSE" "$meta/licenses/LICENSE.abseil-cpp"; \
+    cp "$tp/c-ares/source/LICENSE.md" "$meta/licenses/LICENSE.c-ares"; \
+    cp "$tp/curl/source/COPYING" "$meta/licenses/LICENSE.curl"; \
+    cp "$tp/libpng/source/LICENSE" "$meta/licenses/LICENSE.libpng"; \
+    cp "$tp/libwebm/source/LICENSE.TXT" "$meta/licenses/LICENSE.libwebm"; \
+    cp "$tp/libwebm/source/PATENTS.TXT" "$meta/licenses/PATENTS.libwebm"; \
+    cp "$tp/libxml2/source/Copyright" "$meta/licenses/LICENSE.libxml2"; \
+    cp "$tp/mbedtls/source/LICENSE" "$meta/licenses/LICENSE.mbedtls"; \
+    cp "$tp/protobuf/source/LICENSE" "$meta/licenses/LICENSE.protobuf"; \
+    cp "$tp/protobuf/source/third_party/utf8_range/LICENSE" "$meta/licenses/LICENSE.utf8_range"; \
+    cp "$tp/zlib/source/LICENSE" "$meta/licenses/LICENSE.zlib"; \
+    for f in dict list; do \
+      awk '/\/\*/ { c = 1; b = "" } c { b = b $0 "\n" } c && /\*\// { c = 0; if (b ~ /Copyright/) { printf "%s", b; exit } }' \
+        "$tp/libxml2/source/$f.c" > "$meta/licenses/LICENSE.libxml2-$f"; \
+      grep -q 'Permission to use, copy, modify, and distribute' "$meta/licenses/LICENSE.libxml2-$f"; \
+    done; \
+    for f in "$meta"/licenses/*; do test -s "$f" || { echo "empty: $f" >&2; exit 1; }; done; \
+    echo "${VERSION}" > "$meta/version"; \
+    printf '%s\n' \
+      "https://github.com/shaka-project/shaka-packager.git@${SOURCE_COMMIT}" \
+      "https://github.com/shaka-project/shaka-packager/tree/${SOURCE_COMMIT}" \
+      > "$meta/source"; \
+    { \
+      echo "base: ${BASE_IMAGE}"; \
+      echo "compiler: $(c++ --version | head -n 1)"; \
+      echo "cmake: $(cmake --version | head -n 1)"; \
+      echo "commit: ${SOURCE_COMMIT}"; \
+      grep -E '^(CMAKE_BUILD_TYPE|CMAKE_CXX_FLAGS|BUILD_SHARED_LIBS|FULLY_STATIC|USE_SYSTEM_DEPENDENCIES|CURL_CA_BUNDLE):' /src/build/CMakeCache.txt; \
+      echo "submodules:"; \
+      cat /tmp/submodules; \
+      cat /tmp/packager-version; \
+    } > "$meta/buildinfo"; \
+    ldd "$bin/packager" "$bin/mpd_generator" > /tmp/ldd; \
+    if grep 'not found' /tmp/ldd; then exit 1; fi; \
+    awk '$2 == "=>" && $3 ~ /^\// { print $3 }' /tmp/ldd | LC_ALL=C sort -u > /tmp/libs; \
+    grep -q '/libstdc++\.so\.6$' /tmp/libs; \
+    while read -r path; do \
+      real="$(readlink -f "$path")"; \
+      dpkg-query --search "*${real#/usr}"; \
+    done < /tmp/libs | cut -d: -f1 | LC_ALL=C sort -u | LC_ALL=C comm -23 - /tmp/base-packages > /tmp/elf-deps; \
+    LC_ALL=C sort -u /tmp/elf-deps /tmp/runtime-deps.extra > "$meta/runtime-deps"
+
+FROM ${BASE_IMAGE} AS slim
+ARG DEBIAN_FRONTEND=noninteractive
+RUN --mount=type=bind,from=build,source=/out/usr/local/share/randomcontainers/shaka-packager/runtime-deps,target=/tmp/runtime-deps \
+    set -eu; \
+    apt-get update; \
+    xargs apt-get install -y --no-install-recommends ca-certificates tini < /tmp/runtime-deps; \
+    rm -rf /var/lib/apt/lists/*; \
+    install -d -m 1777 /work /cache
+COPY --link --from=build /out/usr/local/ /usr/local/
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "packager"]
+CMD ["--help"]
