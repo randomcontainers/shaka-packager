@@ -1,0 +1,161 @@
+name: shaka-packager
+title: Shaka Packager
+summary: Packages and encrypts video, audio and subtitles for DASH and HLS with Shaka Packager, together with mpd_generator and pssh-box.py.
+homepage: https://github.com/shaka-project/shaka-packager
+# Shaka Packager (BSD-3-Clause) and the libraries its submodules compile into
+# packager and mpd_generator: protobuf (BSD-3-Clause) with utf8_range (MIT),
+# abseil-cpp (Apache-2.0), Mbed TLS (Apache-2.0 OR GPL-2.0-or-later, used
+# under Apache-2.0), libxml2 (MIT, and ISC-Veillard for dict.c and list.c),
+# c-ares (MIT), curl (curl), zlib (Zlib), libpng (libpng-2.0) and libwebm
+# (BSD-3-Clause). pssh-box.py ships protobuf's Python runtime. mongoose,
+# googletest and nlohmann/json are only used by the tests, and mimalloc only
+# by fully static builds, so none of them is compiled in.
+license: BSD-3-Clause AND Apache-2.0 AND MIT AND ISC-Veillard AND curl AND Zlib AND libpng-2.0
+upstream:
+  source: github-release
+  repository: shaka-project/shaka-packager
+  tag-pattern: '^v(\d+\.\d+\.\d+)$'
+  version-template: '{1}'
+  versioning: semver
+  version: 3.9.3
+  # The releases carry prebuilt binaries for each platform but no source
+  # tarball with the submodules, so the build clones the tag and checks that
+  # it is this commit. The commit also fixes the commit of every submodule.
+  git:
+    url: https://github.com/shaka-project/shaka-packager.git
+    tag: v{version}
+    commit: 0a8ba4fbb4d725eee0e5681c8e19553d3d7dbe31
+image:
+  entrypoint: [packager]
+  cmd: [--help]
+test:
+  - |
+    packager --version > version.txt
+    mpd_generator --version >> version.txt
+    sed -E 's/^(packager|mpd_generator) version v(.+)-[0-9a-f]{7,}-release$/\1 \2/' version.txt > got.txt
+    printf 'packager %s\nmpd_generator %s\n' "$VERSION" "$VERSION" > want.txt
+    cmp -s want.txt got.txt || { cat version.txt >&2; exit 1; }
+    for tool in packager mpd_generator pssh-box.py; do
+      command -v "$tool" > /dev/null || { echo "missing: $tool" >&2; exit 1; }
+    done
+  - |
+    # --licenses prints Shaka Packager's license and then one section per
+    # submodule, headed by the submodule's name.
+    packager --licenses > licenses.txt
+    head -n 1 licenses.txt | grep -Fq 'Google LLC' || { head -n 5 licenses.txt >&2; exit 1; }
+    for name in abseil-cpp curl protobuf; do
+      grep -Fxq "$name" licenses.txt || { echo "no license section for $name" >&2; exit 1; }
+    done
+  - |
+    # A WebVTT file packaged as WebVTT in MP4 with a DASH manifest, and as
+    # WebVTT segments with an HLS playlist.
+    printf 'WEBVTT\n\n00:00:00.000 --> 00:00:01.500\nFirst cue\n\n00:00:02.000 --> 00:00:03.500\nSecond cue\n' > sub.vtt
+    packager 'in=sub.vtt,stream=text,output=sub.mp4' --mpd_output sub.mpd > dash.log 2>&1 \
+      || { cat dash.log >&2; exit 1; }
+    grep -Fq '<MPD' sub.mpd || { cat sub.mpd >&2; exit 1; }
+    grep -Fq 'codecs="wvtt"' sub.mpd || { cat sub.mpd >&2; exit 1; }
+    packager "in=sub.vtt,stream=text,segment_template=sub_\$Number\$.vtt,playlist_name=sub.m3u8,hls_group_id=text,hls_name=English" \
+      --hls_master_playlist_output master.m3u8 > hls.log 2>&1 \
+      || { cat hls.log >&2; exit 1; }
+    test "$(head -n 1 master.m3u8)" = '#EXTM3U' || { cat master.m3u8 >&2; exit 1; }
+    grep -q '^#EXT-X-MEDIA:TYPE=SUBTITLES,URI="sub.m3u8",GROUP-ID="text",.*NAME="English"' master.m3u8 \
+      || { cat master.m3u8 >&2; exit 1; }
+    grep -Fxq sub_1.vtt sub.m3u8 || { cat sub.m3u8 >&2; exit 1; }
+    grep -Fxq 'Second cue' sub_1.vtt || { cat sub_1.vtt >&2; exit 1; }
+  - |
+    # mpd_generator writes the manifest from the media info that packager
+    # leaves next to each output.
+    packager 'in=sub.vtt,stream=text,output=info.mp4' --output_media_info > info.log 2>&1 \
+      || { cat info.log >&2; exit 1; }
+    test -s info.mp4.media_info
+    mpd_generator --input=info.mp4.media_info --output=generated.mpd > generated.log 2>&1 \
+      || { cat generated.log >&2; exit 1; }
+    grep -Fq '<MPD' generated.mpd || { cat generated.mpd >&2; exit 1; }
+    grep -Fq 'codecs="wvtt"' generated.mpd || { cat generated.mpd >&2; exit 1; }
+    grep -Fq 'info.mp4' generated.mpd || { cat generated.mpd >&2; exit 1; }
+  - |
+    # pssh-box.py writes a version 1 Common PSSH box with one key ID, and
+    # writes and reads Widevine PSSH data with the bundled protobuf runtime.
+    kid=00112233445566778899aabbccddeeff
+    pssh-box.py --common-system-id --key-id "$kid" --hex > common.txt
+    printf '%s%s%s%s%s\n' 000000347073736801000000 1077EFECC0B24D02ACE33C1E52E2FB4B 00000001 \
+      00112233445566778899AABBCCDDEEFF 00000000 > common.want
+    cmp -s common.want common.txt || { cat common.txt >&2; exit 1; }
+    pssh-box.py --widevine-system-id --key-id "$kid" --provider example --content-id 0102030405 --base64 > widevine.txt
+    echo AAAAQnBzc2gAAAAA7e+LqXnWSs6jyCfc1R0h7QAAACISEAARIjNEVWZ3iJmqu8zd7v8aB2V4YW1wbGUiBQECAwQF > widevine.want
+    cmp -s widevine.want widevine.txt || { cat widevine.txt >&2; exit 1; }
+    pssh-box.py --from-base64 "$(cat widevine.txt)" --human > human.txt
+    {
+      echo 'PSSH Box v0'
+      echo '  System ID: Widevine edef8ba9-79d6-4ace-a3c8-27dcd51d21ed'
+      echo '  PSSH Data (size: 34):'
+      echo '    Widevine Data:'
+      echo '      Key IDs (1):'
+      echo '        00112233-4455-6677-8899-aabbccddeeff'
+      echo '      Provider: example'
+      echo '      Content ID: 0102030405'
+    } > human.want
+    cmp -s human.want human.txt || { cat human.txt >&2; exit 1; }
+examples:
+  - title: Package an MP4 file for DASH and HLS
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/shaka-packager 'in=input.mp4,stream=video,output=video.mp4,playlist_name=video.m3u8' 'in=input.mp4,stream=audio,output=audio.mp4,playlist_name=audio.m3u8' --mpd_output manifest.mpd --hls_master_playlist_output master.m3u8
+  - title: Encrypt an MP4 file with a raw key (CENC)
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/shaka-packager 'in=input.mp4,stream=video,output=video.mp4' --enable_raw_key_encryption --keys 'label=:key_id=<32 hex digits>:key=<32 hex digits>' --protection_scheme cenc
+  - title: Print a Widevine PSSH box for a key ID
+    command: docker run --rm --entrypoint pssh-box.py ghcr.io/randomcontainers/shaka-packager --widevine-system-id --key-id 00112233445566778899aabbccddeeff --base64
+  - title: Encode a video with FFmpeg and package it for HLS (default image)
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" --entrypoint sh ghcr.io/randomcontainers/shaka-packager -c 'ffmpeg -loglevel error -i input.mov -c:v libx264 -g 50 -c:a aac encoded.mp4 && packager in=encoded.mp4,stream=video,output=video.mp4,playlist_name=video.m3u8 in=encoded.mp4,stream=audio,output=audio.mp4,playlist_name=audio.m3u8 --hls_master_playlist_output master.m3u8'
+combos:
+  - with: [ffmpeg]
+    default: true
+    base: ffmpeg
+    summary: Shaka Packager with FFmpeg, for encoding renditions and packaging them for DASH and HLS in one container.
+    test:
+      - |
+        # Two H.264 renditions with a keyframe every second and one AAC track,
+        # packaged into one-second segments for DASH and HLS and read back by
+        # ffprobe through each manifest.
+        run() { ffmpeg -hide_banner -loglevel error -y "$@"; }
+        for size in 320x180 160x90; do
+          run -f lavfi -i "testsrc2=size=$size:rate=25:duration=3" -c:v libx264 -pix_fmt yuv420p \
+            -g 25 -keyint_min 25 -sc_threshold 0 "video-$size.mp4"
+        done
+        run -f lavfi -i sine=frequency=440:duration=3 -c:a aac audio.mp4
+        packager \
+          "in=video-320x180.mp4,stream=video,init_segment=v320_init.mp4,segment_template=v320_\$Number\$.m4s,playlist_name=v320.m3u8" \
+          "in=video-160x90.mp4,stream=video,init_segment=v160_init.mp4,segment_template=v160_\$Number\$.m4s,playlist_name=v160.m3u8" \
+          "in=audio.mp4,stream=audio,init_segment=a_init.mp4,segment_template=a_\$Number\$.m4s,playlist_name=a.m3u8,hls_group_id=audio,hls_name=main" \
+          --segment_duration 1 --generate_static_live_mpd \
+          --mpd_output out.mpd --hls_master_playlist_output master.m3u8 > package.log 2>&1 \
+          || { cat package.log >&2; exit 1; }
+        test "$(grep -c '<Representation [^>]*mimeType="video/mp4"' out.mpd)" -eq 2 || { cat out.mpd >&2; exit 1; }
+        test "$(grep -c '<Representation [^>]*mimeType="audio/mp4"' out.mpd)" -eq 1 || { cat out.mpd >&2; exit 1; }
+        test "$(grep -c '^#EXT-X-STREAM-INF:' master.m3u8)" -eq 2 || { cat master.m3u8 >&2; exit 1; }
+        grep -q '^#EXT-X-MEDIA:TYPE=AUDIO,' master.m3u8 || { cat master.m3u8 >&2; exit 1; }
+        for manifest in master.m3u8 out.mpd; do
+          ffprobe -v error -show_entries stream=codec_name -of csv=p=0 "$manifest" > "$manifest.codecs" 2> "$manifest.log" \
+            || { cat "$manifest.log" >&2; exit 1; }
+          for codec in h264 aac; do
+            grep -qx "$codec" "$manifest.codecs" || { echo "no $codec stream in $manifest" >&2; cat "$manifest.codecs" >&2; exit 1; }
+          done
+        done
+      - |
+        # Raw-key CENC with every sample encrypted. FFmpeg decrypts enc.mp4
+        # with the key and must decode the same frames as from the clear file,
+        # and different ones without the key.
+        run() { ffmpeg -hide_banner -loglevel error -y "$@"; }
+        run -f lavfi -i testsrc2=size=320x180:rate=25:duration=2 -c:v libx264 -pix_fmt yuv420p -g 25 clear.mp4
+        kid=00112233445566778899aabbccddeeff
+        key=0123456789abcdef0123456789abcdef
+        packager 'in=clear.mp4,stream=video,output=enc.mp4' --enable_raw_key_encryption \
+          --keys "label=:key_id=$kid:key=$key" --protection_scheme cenc --clear_lead 0 > encrypt.log 2>&1 \
+          || { cat encrypt.log >&2; exit 1; }
+        grep -Fq tenc enc.mp4 || { echo "enc.mp4 has no tenc box" >&2; exit 1; }
+        grep -Fq pssh enc.mp4 || { echo "enc.mp4 has no pssh box" >&2; exit 1; }
+        hashes() { ffmpeg -hide_banner -loglevel error "$@" -map 0:v -f framemd5 - 2> /dev/null | awk -F', *' '!/^#/ { print $NF }'; }
+        hashes -i clear.mp4 > clear.md5
+        hashes -decryption_key "$key" -i enc.mp4 > decrypted.md5
+        hashes -i enc.mp4 > encrypted.md5
+        test "$(grep -c . clear.md5)" -eq 50 || { cat clear.md5 >&2; exit 1; }
+        cmp -s clear.md5 decrypted.md5 || { echo "the decrypted frames differ from the clear ones" >&2; exit 1; }
+        if cmp -s clear.md5 encrypted.md5; then echo "enc.mp4 decodes without the key" >&2; exit 1; fi
